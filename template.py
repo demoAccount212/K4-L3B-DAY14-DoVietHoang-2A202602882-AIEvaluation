@@ -542,10 +542,20 @@ class BenchmarkRunner:
         Returns:
             List of EvalResult, one per qa_pair.
         """
-        # TODO: for each pair, call agent_fn(pair.question), then run_full_eval.
-        # Pass pair.retrieved_contexts as the optional contexts argument and
-        # preserve the original pair on the returned EvalResult.
-        raise NotImplementedError("Implement BenchmarkRunner.run")
+        results = []
+        for pair in qa_pairs:
+            actual_answer = agent_fn(pair.question)
+            eval_result = evaluator.run_full_eval(
+                answer=actual_answer,
+                question=pair.question,
+                context=pair.context,
+                expected=pair.expected_answer,
+                contexts=pair.retrieved_contexts if pair.retrieved_contexts else None,
+            )
+            # Preserve the original qa_pair
+            eval_result.qa_pair = pair
+            results.append(eval_result)
+        return results
 
     def generate_report(self, results: list[EvalResult]) -> dict[str, Any]:
         """
@@ -567,8 +577,51 @@ class BenchmarkRunner:
         Average only non-None retrieval scores. Return None for a retrieval
         average when no result contains that metric.
         """
-        # TODO
-        raise NotImplementedError("Implement generate_report")
+        if not results:
+            return {
+                "total": 0,
+                "passed": 0,
+                "pass_rate": 0.0,
+                "avg_faithfulness": 0.0,
+                "avg_relevance": 0.0,
+                "avg_completeness": 0.0,
+                "avg_context_recall": None,
+                "avg_context_precision": None,
+                "failure_types": {},
+            }
+
+        total = len(results)
+        passed = sum(1 for r in results if r.passed)
+        pass_rate = passed / total
+
+        avg_faithfulness = sum(r.faithfulness for r in results) / total
+        avg_relevance = sum(r.relevance for r in results) / total
+        avg_completeness = sum(r.completeness for r in results) / total
+
+        # Average only non-None retrieval scores
+        recall_scores = [r.context_recall for r in results if r.context_recall is not None]
+        precision_scores = [r.context_precision for r in results if r.context_precision is not None]
+
+        avg_context_recall = sum(recall_scores) / len(recall_scores) if recall_scores else None
+        avg_context_precision = sum(precision_scores) / len(precision_scores) if precision_scores else None
+
+        # Count failure types
+        failure_types = {}
+        for r in results:
+            if r.failure_type:
+                failure_types[r.failure_type] = failure_types.get(r.failure_type, 0) + 1
+
+        return {
+            "total": total,
+            "passed": passed,
+            "pass_rate": pass_rate,
+            "avg_faithfulness": avg_faithfulness,
+            "avg_relevance": avg_relevance,
+            "avg_completeness": avg_completeness,
+            "avg_context_recall": avg_context_recall,
+            "avg_context_precision": avg_context_precision,
+            "failure_types": failure_types,
+        }
 
     def run_regression(self, new_results: list, baseline_results: list) -> dict:
         """Compare new evaluation results against a baseline.
@@ -589,10 +642,35 @@ class BenchmarkRunner:
               - 'baseline_avg_completeness': float
               - 'regressions': list[str] — names of metrics that regressed
               - 'passed': bool — True if no regressions
-
-        TODO: Compute avg per metric, compare, list regressions, set passed flag
         """
-        raise NotImplementedError
+        def compute_averages(results_list):
+            if not results_list:
+                return {"faithfulness": 0.0, "relevance": 0.0, "completeness": 0.0}
+            n = len(results_list)
+            return {
+                "faithfulness": sum(r.faithfulness for r in results_list) / n,
+                "relevance": sum(r.relevance for r in results_list) / n,
+                "completeness": sum(r.completeness for r in results_list) / n,
+            }
+
+        new_avg = compute_averages(new_results)
+        baseline_avg = compute_averages(baseline_results)
+
+        regressions = []
+        for metric in ["faithfulness", "relevance", "completeness"]:
+            if baseline_avg[metric] - new_avg[metric] > 0.05:
+                regressions.append(metric)
+
+        return {
+            "new_avg_faithfulness": new_avg["faithfulness"],
+            "new_avg_relevance": new_avg["relevance"],
+            "new_avg_completeness": new_avg["completeness"],
+            "baseline_avg_faithfulness": baseline_avg["faithfulness"],
+            "baseline_avg_relevance": baseline_avg["relevance"],
+            "baseline_avg_completeness": baseline_avg["completeness"],
+            "regressions": regressions,
+            "passed": len(regressions) == 0,
+        }
 
     def identify_failures(
         self,
@@ -609,8 +687,13 @@ class BenchmarkRunner:
         Returns:
             List of failing EvalResults.
         """
-        # TODO
-        raise NotImplementedError("Implement identify_failures")
+        failures = []
+        for r in results:
+            if (r.faithfulness < threshold or
+                r.relevance < threshold or
+                r.completeness < threshold):
+                failures.append(r)
+        return failures
 
 
 # ---------------------------------------------------------------------------
@@ -644,8 +727,11 @@ class FailureAnalyzer:
             dict mapping failure_type → count.
             Example: {"hallucination": 3, "irrelevant": 2, "incomplete": 5}
         """
-        # TODO
-        raise NotImplementedError("Implement categorize_failures")
+        counts = {}
+        for failure in failures:
+            ft = failure.failure_type or "unknown"
+            counts[ft] = counts.get(ft, 0) + 1
+        return counts
 
     def find_root_cause(self, failure: EvalResult) -> str:
         """
@@ -657,8 +743,25 @@ class FailureAnalyzer:
             "Answer is missing key information — increase context window or improve generation"
             "Multiple issues detected — review full pipeline"
         """
-        # TODO: compare faithfulness, relevance, completeness, return appropriate string
-        raise NotImplementedError("Implement find_root_cause")
+        scores = {
+            "faithfulness": failure.faithfulness,
+            "relevance": failure.relevance,
+            "completeness": failure.completeness,
+        }
+        min_score = min(scores.values())
+        min_metrics = [k for k, v in scores.items() if v == min_score]
+
+        if len(min_metrics) > 1:
+            return "Multiple issues detected — review full pipeline"
+
+        metric = min_metrics[0]
+        if metric == "faithfulness":
+            return "Context is missing or irrelevant — improve retrieval"
+        elif metric == "relevance":
+            return "Answer does not address the question — improve prompt clarity"
+        elif metric == "completeness":
+            return "Answer is missing key information — increase context window or improve generation"
+        return "Multiple issues detected — review full pipeline"
 
     def generate_improvement_log(self, failures: list, suggestions: list[str]) -> str:
         """Generate a Markdown table logging failures and improvement actions.
@@ -674,10 +777,24 @@ class FailureAnalyzer:
 
         Returns:
             Markdown table string with a row per failure. Status is always "Open".
-
-        TODO: Build markdown table with failure details + matched suggestions
         """
-        raise NotImplementedError
+        if not failures:
+            return "| Failure ID | Type | Root Cause | Suggested Fix | Status |\n|------------|------|------------|---------------|--------|\n| — | — | — | — | — |"
+
+        lines = [
+            "| Failure ID | Type | Root Cause | Suggested Fix | Status |",
+            "|------------|------|------------|---------------|--------|",
+        ]
+        for i, failure in enumerate(failures):
+            failure_id = f"F{i+1:03d}"
+            failure_type = failure.failure_type or "unknown"
+            root_cause = self.find_root_cause(failure)
+            suggestion = suggestions[i] if i < len(suggestions) else "No suggestion available"
+            # Escape pipe characters for markdown
+            root_cause = root_cause.replace("|", "\\|")
+            suggestion = suggestion.replace("|", "\\|")
+            lines.append(f"| {failure_id} | {failure_type} | {root_cause} | {suggestion} | Open |")
+        return "\n".join(lines)
 
     def generate_improvement_suggestions(
         self, failures: list[EvalResult]
@@ -695,8 +812,39 @@ class FailureAnalyzer:
         Returns:
             List of at least 3 suggestion strings (or fewer if failures is empty).
         """
-        # TODO: analyze categorized failures and return suggestions
-        raise NotImplementedError("Implement generate_improvement_suggestions")
+        if not failures:
+            return []
+
+        categories = self.categorize_failures(failures)
+        suggestions = []
+
+        # Prioritize based on most common failure types
+        if categories.get("hallucination", 0) > 0:
+            suggestions.append("Implement hallucination checker to filter unsupported claims")
+            suggestions.append("Add citations/grounding verification to RAG pipeline")
+
+        if categories.get("incomplete", 0) > 0:
+            suggestions.append("Increase chunk size or top-k in RAG pipeline to reduce context fragmentation")
+            suggestions.append("Add few-shot examples showing complete answers to improve completeness")
+
+        if categories.get("irrelevant", 0) > 0:
+            suggestions.append("Refine prompt with clearer instructions and few-shot examples for relevance")
+            suggestions.append("Improve query understanding / intent detection in the agent")
+
+        if categories.get("off_topic", 0) > 0:
+            suggestions.append("Add guardrails to detect and handle out-of-scope questions")
+
+        # Ensure at least 3 suggestions
+        default_suggestions = [
+            "Increase chunk size in RAG pipeline to reduce context fragmentation",
+            "Add few-shot examples showing complete answers to improve completeness",
+            "Implement hallucination checker to filter unsupported claims",
+        ]
+        for s in default_suggestions:
+            if s not in suggestions:
+                suggestions.append(s)
+
+        return suggestions[:10]  # Return top 10 max
 
 
 # ---------------------------------------------------------------------------
