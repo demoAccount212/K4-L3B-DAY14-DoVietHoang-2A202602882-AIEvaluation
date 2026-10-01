@@ -23,6 +23,14 @@ from typing import Any, Protocol
 from dotenv import load_dotenv
 from openai import OpenAI, OpenAIError
 
+# Optional: google-genai for Gemini support
+try:
+    from google import genai
+    from google.genai import types as genai_types
+    GENAI_AVAILABLE = True
+except ImportError:
+    GENAI_AVAILABLE = False
+
 load_dotenv(Path(__file__).resolve().with_name(".env"))
 
 TOKEN_RE = re.compile(r"[a-z0-9]+")
@@ -264,6 +272,104 @@ class OpenAIGenerator:
         if not answer:
             raise RuntimeError("OpenAI returned an empty answer")
         return answer
+
+
+class GeminiGenerator:
+    """Google Gemini generator implementing the TextGenerator protocol."""
+    def __init__(self, max_output_tokens: int = 300) -> None:
+        if not GENAI_AVAILABLE:
+            raise RuntimeError("google-genai package not installed. Run: pip install google-genai")
+        api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        self.model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY is missing from .env")
+        self.client = genai.Client(api_key=api_key)
+        self.max_output_tokens = max_output_tokens
+
+    def generate(self, prompt: str) -> str:
+        # Use system instruction to suppress thinking and enforce grounded answers
+        system_instruction = (
+            "You are a grounded domain assistant for OrbitTech customer support. "
+            "Answer concisely using ONLY the provided context. "
+            "Do NOT output any reasoning, thinking process, chain-of-thought, or internal monologue. "
+            "Do NOT include phrases like 'Here is the answer', 'Based on the context', or similar preambles. "
+            "Output ONLY the direct answer to the question. "
+            "If the context does not contain the answer, state that the information is not available in the provided documents."
+        )
+        response = self.client.models.generate_content(
+            model=self.model,
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=0,
+                max_output_tokens=self.max_output_tokens,
+            ),
+        )
+        answer = response.text.strip() if response.text else ""
+        if not answer:
+            raise RuntimeError("Gemini returned an empty answer")
+        return answer
+
+
+class OpenRouterGenerator:
+    """OpenRouter generator using OpenAI-compatible Chat Completions API."""
+    def __init__(self, max_output_tokens: int = 300) -> None:
+        api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+        self.model = os.getenv("OPENROUTER_MODEL", "").strip()
+        base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").strip()
+        if not api_key:
+            raise RuntimeError("OPENROUTER_API_KEY is missing from .env")
+        if not self.model:
+            raise RuntimeError("OPENROUTER_MODEL is missing from .env")
+        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        self.max_output_tokens = max_output_tokens
+
+    def generate(self, prompt: str) -> str:
+        # Use Chat Completions API (OpenRouter compatible)
+        # Add system prompt to suppress thinking/reasoning output
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a grounded domain assistant. Answer concisely using only the provided context. "
+                    "Do NOT output any reasoning, thinking process, chain-of-thought, or internal monologue. "
+                    "Output ONLY the final answer."
+                )
+            },
+            {"role": "user", "content": prompt}
+        ]
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=0,
+            max_tokens=self.max_output_tokens,
+        )
+        answer = response.choices[0].message.content.strip() if response.choices[0].message.content else ""
+        # Strip common thinking/reasoning patterns
+        answer = self._strip_thinking(answer)
+        if not answer:
+            raise RuntimeError("OpenRouter returned an empty answer")
+        return answer
+
+    @staticmethod
+    def _strip_thinking(text: str) -> str:
+        """Remove common thinking/reasoning patterns from model output."""
+        import re
+        # Remove "Here's a thinking process:" and similar prefixes
+        patterns = [
+            r"^Here'?s? a thinking process:.*?(?=\n\n|\n[A-Z]|\Z)",
+            r"^Thinking process:.*?(?=\n\n|\n[A-Z]|\Z)",
+            r"^Let me think:.*?(?=\n\n|\n[A-Z]|\Z)",
+            r"^<thinking>.*?</thinking>\s*",
+            r"^<reasoning>.*?</reasoning>\s*",
+            r"^\*\*Thinking\*\*:.*?(?=\n\n|\n[A-Z]|\Z)",
+            r"^\d+\.\s+\*\*Analyze.*?(?=\n\n|\n[A-Z]|\Z)",  # Numbered thinking steps
+        ]
+        for pattern in patterns:
+            text = re.sub(pattern, "", text, flags=re.DOTALL | re.IGNORECASE)
+        # Clean up extra whitespace
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
 
 
 @dataclass(frozen=True)
